@@ -1,6 +1,7 @@
 import express from 'express';
 import pool from '../db.js';
 import auth from '../middleware/auth.js';
+import { getStopsForRoute, calculateSegmentFare } from '../utils/routeHelpers.js';
 
 const router = express.Router();
 
@@ -27,7 +28,56 @@ router.get('/routes', auth, async (req, res) => {
        FROM routes
        ORDER BY bus_number, from_stop, to_stop`
     );
-    res.json({ routes: result.rows });
+    const routes = result.rows.map((route) => ({
+      ...route,
+      stops: getStopsForRoute(route),
+    }));
+    res.json({ routes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/route/:id', auth, async (req, res) => {
+  if (req.user.role !== 'operator' && req.user.role !== 'passenger') {
+    return res.status(403).json({ error: 'Operators or passengers only' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id, bus_number, from_stop, to_stop, fare
+       FROM routes
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Route not found' });
+    }
+    const route = result.rows[0];
+    route.stops = getStopsForRoute(route);
+    res.json({ route });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/session/current', auth, async (req, res) => {
+  if (req.user.role !== 'operator') {
+    return res.status(403).json({ error: 'Operators only' });
+  }
+
+  try {
+    await ensureSessionTable();
+    const result = await pool.query(
+      `SELECT s.operator_id, s.route_id, s.started_at, s.active,
+              r.bus_number, r.from_stop, r.to_stop, r.fare
+       FROM active_bus_sessions s
+       JOIN routes r ON r.id = s.route_id
+       WHERE s.operator_id = $1 AND s.active = TRUE
+       LIMIT 1`,
+      [req.user.id]
+    );
+    res.json({ session: result.rows[0] || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -149,7 +199,7 @@ router.post('/checkin', auth, async (req, res) => {
     }
 
     const routeResult = await client.query(
-      `SELECT fare, from_stop, to_stop FROM routes WHERE id = $1`,
+      `SELECT fare, from_stop, to_stop, bus_number FROM routes WHERE id = $1`,
       [route_id]
     );
     if (routeResult.rows.length === 0) {
@@ -157,19 +207,37 @@ router.post('/checkin', auth, async (req, res) => {
       return res.status(404).json({ error: 'Route not found' });
     }
     const route = routeResult.rows[0];
+    const destination_stop = String(req.body.destination_stop || '').trim();
 
-    if (passenger.wallet_balance < route.fare) {
+    if (!destination_stop || destination_stop === route.from_stop) {
       await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Please select a valid destination stop' });
+    }
+
+    const fareAmount = calculateSegmentFare(route, route.from_stop, destination_stop);
+    if (fareAmount === null) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid destination selected' });
+    }
+
+    if (passenger.wallet_balance < fareAmount) {
+      await client.query(
+        `INSERT INTO transactions
+         (passenger_id, operator_id, route_id, fare_amount, status, nfc_token)
+         VALUES ($1, $2, $3, $4, 'insufficient_funds', $5)`,
+        [passenger_id, operator_id, route_id, fareAmount, passenger_id]
+      );
+      await client.query('COMMIT');
       return res.status(402).json({ error: 'Insufficient balance' });
     }
 
     await client.query(
       `UPDATE users SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
-      [route.fare, passenger_id]
+      [fareAmount, passenger_id]
     );
     await client.query(
       `UPDATE users SET wallet_balance = wallet_balance + $1 WHERE id = $2`,
-      [route.fare, operator_id]
+      [fareAmount, operator_id]
     );
 
     const txn = await client.query(
@@ -177,15 +245,15 @@ router.post('/checkin', auth, async (req, res) => {
        (passenger_id, operator_id, route_id, fare_amount, status, nfc_token)
        VALUES ($1, $2, $3, $4, 'success', $5)
        RETURNING id, created_at`,
-      [passenger_id, operator_id, route_id, route.fare, passenger_id]
+      [passenger_id, operator_id, route_id, fareAmount, passenger_id]
     );
 
     await client.query('COMMIT');
     res.json({
       message: 'Payment successful',
       transaction_id: txn.rows[0].id,
-      route: `${route.from_stop} → ${route.to_stop}`,
-      fare_rupees: (route.fare / 100).toFixed(2),
+      route: `${route.from_stop} → ${destination_stop}`,
+      fare_rupees: (fareAmount / 100).toFixed(2),
       timestamp: txn.rows[0].created_at
     });
 

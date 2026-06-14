@@ -5,6 +5,7 @@ import authRoutes from './routes/auth.js';
 import walletRoutes from './routes/wallet.js';
 import paymentRoutes from './routes/payment.js';
 import conductorRoutes from './routes/conductor.js';
+import trackingRoutes from './routes/tracking.js';
 
 dotenv.config();
 
@@ -15,6 +16,7 @@ app.use('/conductor', conductorRoutes);
 app.use('/auth', authRoutes);
 app.use('/wallet', walletRoutes);
 app.use('/payment', paymentRoutes);
+app.use('/tracking', trackingRoutes);
 
 app.listen(process.env.PORT, () => {
   console.log(`Server is running on port ${process.env.PORT}`);

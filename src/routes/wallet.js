@@ -44,4 +44,28 @@ router.post('/topup', authMiddleware, async (req, res) => {
     }
 });
 
+router.get('/trips/recent', authMiddleware, async (req, res) => {
+    if (req.user.role !== 'passenger') {
+        return res.status(403).json({ error: 'Passengers only' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT t.id, t.fare_amount, t.status, t.created_at,
+                    r.bus_number, r.from_stop, r.to_stop,
+                    u.name AS operator_name
+             FROM transactions t
+             JOIN routes r ON r.id = t.route_id
+             JOIN users u ON u.id = t.operator_id
+             WHERE t.passenger_id = $1
+             ORDER BY t.created_at DESC
+             LIMIT 10`,
+            [req.user.id]
+        );
+        res.json({ trips: result.rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 export default router;
